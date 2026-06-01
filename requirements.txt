@@ -1,0 +1,10 @@
+# Core ML compression & conversion pipeline — verified working set
+# Target: Apple Silicon (arm64), macOS 15+ / Python 3.13
+# NOTE: coremltools 9.0 is required for Python 3.13 native extensions
+#       (libcoremlpython / libmilstoragepython) which power on-device
+#       prediction, compute-plan device detection, and INT4 blob storage.
+
+torch==2.7.0
+torchvision==0.22.0
+coremltools==9.0
+numpy==2.3.3

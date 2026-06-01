@@ -1,0 +1,33 @@
+# --- Build artifacts (regenerable via `python compressor.py`) ---
+artifacts/
+*.mlpackage/
+*.mlmodelc/
+*.mlmodel
+*.pt
+*.pth
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# --- Caches / tooling ---
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# --- Local tooling / agent settings ---
+.claude/
+
+# --- OS / editor ---
+.DS_Store
+.idea/
+.vscode/
+*.swp
