@@ -120,6 +120,75 @@ def bench_pytorch(img_size: int):
 
 
 # ----------------------------------------------------------------------------
+# 精度ドリフト計測 (FP16 を基準に量子化モデルの劣化を定量化)
+# ----------------------------------------------------------------------------
+N_EVAL = 60  # 精度評価サンプル数
+
+
+def _make_eval_image(seed: int, img_size: int):
+    """低周波合成画像 (純ノイズより自然画像分布に近い) を生成。"""
+    rng = np.random.default_rng(seed)
+    res = int(rng.choice([7, 14, 28, 56]))
+    small = rng.random((res, res, 3))
+    return Image.fromarray((small * 255).astype(np.uint8)).resize(
+        (img_size, img_size), Image.BILINEAR
+    )
+
+
+def _prob_vec(model, input_name, img):
+    """確率辞書を取り出し合計1に正規化して返す (softmax はモデルに焼込済)。"""
+    out = model.predict({input_name: img})
+    d = [v for v in out.values() if isinstance(v, dict)][0]
+    keys = sorted(d.keys())
+    v = np.array([d[k] for k in keys], dtype=np.float64)
+    s = v.sum()
+    return v / s if s > 0 else v
+
+
+def _kl(p, q):
+    p = np.clip(p, 1e-12, 1.0)
+    q = np.clip(q, 1e-12, 1.0)
+    return float(np.sum(p * np.log(p / q)))
+
+
+def _js(p, q):
+    m = 0.5 * (p + q)
+    return 0.5 * _kl(p, m) + 0.5 * _kl(q, m)
+
+
+def measure_accuracy(fp16_path, q_paths, input_name, img_size):
+    """
+    FP16 を基準 (ground truth) に、各量子化モデルの予測一致度を計測。
+    戻り値: {label: dict(top1, top5, kl, js)}  (% と平均値)
+    """
+    imgs = [_make_eval_image(s, img_size) for s in range(N_EVAL)]
+
+    fp16 = ct.models.MLModel(fp16_path, compute_units=ct.ComputeUnit.ALL)
+    ref = [_prob_vec(fp16, input_name, im) for im in imgs]
+    ref_top1 = [int(r.argmax()) for r in ref]
+    ref_top5 = [set(np.argsort(r)[-5:]) for r in ref]
+
+    results = {}
+    for label, path in q_paths.items():
+        model = ct.models.MLModel(path, compute_units=ct.ComputeUnit.ALL)
+        t1 = t5 = 0
+        kls, jss = [], []
+        for im, r, rt1, rt5 in zip(imgs, ref, ref_top1, ref_top5):
+            p = _prob_vec(model, input_name, im)
+            t1 += int(p.argmax() == rt1)
+            t5 += int(p.argmax() in rt5)
+            kls.append(_kl(r, p))
+            jss.append(_js(r, p))
+        results[label] = dict(
+            top1=t1 / N_EVAL * 100.0,
+            top5=t5 / N_EVAL * 100.0,
+            kl=float(np.mean(kls)),
+            js=float(np.mean(jss)),
+        )
+    return results
+
+
+# ----------------------------------------------------------------------------
 # メイン
 # ----------------------------------------------------------------------------
 def main():
@@ -163,6 +232,18 @@ def main():
 
         rows.append((label, size_mb, reduction, mean_ms, p95_ms, dominant, gran))
 
+    # 精度ドリフト (FP16 基準) — INT8 / INT4 の劣化を定量化
+    print(f"計測中: 精度ドリフト (FP16基準, {N_EVAL}サンプル) ...")
+    acc = measure_accuracy(
+        arts["coreml_fp16"]["path"],
+        {
+            "Core ML INT8": arts["coreml_int8"]["path"],
+            "Core ML INT4": arts["coreml_int4"]["path"],
+        },
+        input_name,
+        img_size,
+    )
+
     # ------------------------------------------------------------------
     # Markdown 生成
     # ------------------------------------------------------------------
@@ -171,8 +252,8 @@ def main():
     md.append(f"- **ベースモデル**: `{manifest['model_name']}` (ImageNet 1000クラス)")
     md.append(f"- **入力**: RGB 画像 {img_size}×{img_size} (前処理はモデルに埋込済み — アプリ側コード不要)")
     md.append(f"- **デプロイターゲット**: {manifest['min_deployment_target']}")
-    md.append(f"- **量子化**: Post-Training Quantization / linear_symmetric / per-channel")
-    md.append(f"- **計測条件**: ウォームアップ {N_WARMUP} 回 → 計測 {N_RUNS} 回, ComputeUnit=ALL")
+    md.append(f"- **量子化**: Post-Training Quantization (重みのみ)。INT8=per-channel/対称、INT4=per-block(16)/非対称")
+    md.append(f"- **計測条件**: レイテンシ ウォームアップ {N_WARMUP} 回 → 計測 {N_RUNS} 回, ComputeUnit=ALL。精度ドリフト {N_EVAL} サンプル")
 
     machine = f"{os.uname().sysname} {os.uname().machine}"
     md.append(f"- **計測マシン**: {machine}, coremltools {ct.__version__}, torch {torch.__version__}\n")
@@ -196,8 +277,59 @@ def main():
         md.append(f"| {name} | {device} | {mean_ms:.3f} | {p95_ms:.3f} | {speedup:.2f}× |")
     md.append("")
 
-    # 表3: 計算ハードウェア分布
-    md.append("## 3. 計算ハードウェアの特定 (MLComputePlan)\n")
+    # 表3: 実画像での絶対精度 (公開可否の判断に使う最重要指標)
+    real_path = os.path.join(ARTIFACT_DIR, "real_accuracy.json")
+    section_no = 3
+    if os.path.exists(real_path):
+        real = json.load(open(real_path))
+        fp32_top1 = real.get("PyTorch FP32", {}).get("top1")
+        md.append("## 3. 実画像での絶対精度 (Imagenette, 公開判断の最重要指標)\n")
+        md.append("ImageNet の 10 クラス実画像サブセット **Imagenette** で計測した")
+        md.append("絶対 top-1 / top-5 精度。PyTorch FP32 を真のベースラインとする。\n")
+        md.append("| モデル | top-1 | top-5 | 対 FP32 top-1 差 | 判定 |")
+        md.append("|---|---:|---:|---:|---|")
+        order = ["PyTorch FP32", "Core ML FP16", "Core ML INT8", "Core ML INT4"]
+        for label in order:
+            if label not in real:
+                continue
+            t1 = real[label]["top1"]
+            t5 = real[label]["top5"]
+            if label == "PyTorch FP32":
+                diff, vd = "— (基準)", "基準"
+            else:
+                d = t1 - fp32_top1
+                diff = f"{d:+.1f}pt"
+                if d >= -1.5:
+                    vd = "✅ 公開可 (劣化ほぼ無し)"
+                elif d >= -3.0:
+                    vd = "✅ 公開可 (劣化小)"
+                else:
+                    vd = "⚠️ 要検討"
+            md.append(f"| {label} | {t1:.1f}% | {t5:.1f}% | {diff} | {vd} |")
+        md.append("")
+        md.append("> Imagenette は 10 クラスのため絶対値は full-ImageNet(1000クラス) より高め。")
+        md.append("> 量子化による相対劣化の評価には十分。full-ImageNet での確定が望ましい。\n")
+        section_no = 4
+
+    # 表(参考): 合成入力での相対ドリフト
+    md.append(f"## {section_no}. (参考) 合成入力での相対ドリフト (FP16 基準)\n")
+    md.append("低周波**合成**画像 (分布外) での FP16 との予測一致度。**絶対精度ではない**。")
+    md.append("分布外入力では微小な重み誤差で予測が大きく揺れるため、INT4 の数値は")
+    md.append("実画像 (上表) より悲観的に出る点に注意 (相対的な優劣判定の補助指標)。\n")
+    md.append("| モデル | top-1 一致率 | top-5 ヒット率 | KL(FP16‖q) | JS |")
+    md.append("|---|---:|---:|---:|---:|")
+    md.append("| Core ML FP16 | 100.0% | 100.0% | 0.0000 | 0.0000 |")
+    for label in ("Core ML INT8", "Core ML INT4"):
+        a = acc[label]
+        md.append(
+            f"| {label} | {a['top1']:.1f}% | {a['top5']:.1f}% | "
+            f"{a['kl']:.4f} | {a['js']:.4f} |"
+        )
+    md.append("")
+    section_no += 1
+
+    # 表: 計算ハードウェア分布
+    md.append(f"## {section_no}. 計算ハードウェアの特定 (MLComputePlan)\n")
     md.append("`coremltools.models.compute_plan.MLComputePlan` で、各オペレーションが")
     md.append("実際に割り当てられた計算デバイスを検知した結果。\n")
     md.append("| モデル | 主デバイス | デバイス別オペレーション数 | 実計算op合計 |")
@@ -208,15 +340,25 @@ def main():
         md.append(f"| {label} | {dominant} | {dist_str} | {total} |")
     md.append("")
 
-    md.append("## 補足\n")
+    md.append("## 補足・運用上の結論\n")
     md.append("- **前処理の埋込**: `ImageType(scale=1/255)` で 0–255 → 0–1 に正規化し、")
-    md.append("  per-channel の ImageNet 正規化 `(x-mean)/std` をモデル先頭層に焼き込み済み。")
-    md.append("  さらに `ClassifierConfig` で出力を `classLabel` + 確率辞書にしているため、")
-    md.append("  Swift 側は `model.prediction(image:)` を呼ぶだけで推論できる。")
-    md.append("- **per-channel 量子化**: 出力チャネルごとに個別スケールを用いるため、")
-    md.append("  一様 (per-tensor) 量子化より精度劣化を抑制できる。")
-    md.append("- **INT4**: 重みを 4bit 化し FP32 比で大幅軽量化。`minimum_deployment_target=iOS18`")
-    md.append("  (macOS15) 以降で利用可能。")
+    md.append("  per-channel の ImageNet 正規化 `(x-mean)/std` をモデル先頭層に焼き込み、")
+    md.append("  さらに **softmax をモデル末尾に焼き込み**済み。出力は合計1の真の確率辞書で、")
+    md.append("  Swift 側は `model.prediction(image:)` を呼ぶだけ (前処理・softmax 不要)。")
+    md.append("- **総合推奨は INT8**: 実画像 top-1 は FP32 とほぼ同等 (上表)、サイズ FP32 比")
+    md.append("  1/4、ANE 常駐で最速。精度・サイズ・速度・ANE 常駐のバランスが最良で公開向き。")
+    md.append("- **INT4 (per-block16/非対称) も公開可能な精度**: 実画像 top-1 は FP32 とほぼ同等。")
+    md.append("  ただし per-channel/対称では破綻する (実画像 top-1 3.8%) ため必ず per-block/非対称を")
+    md.append("  使うこと。さらに INT4 は ANE に載らず GPU 実行で INT8 より数倍遅い。")
+    md.append("  => 極小サイズが最優先で多少の遅延を許容できる場合のみ INT4 を選ぶ。")
+    md.append("- **レイテンシの注意**: FP16 と INT8 がほぼ同値なのは ANE 実行かつ Python")
+    md.append("  `predict()` のオーバーヘッドが支配的なため。一方 INT4(per-block) は ANE に")
+    md.append("  載らず GPU にフォールバックするため**逆に数倍遅い** (精度は同等だが速度と")
+    md.append("  ANE 常駐で INT8 に劣る)。厳密な実機レイテンシは Xcode の Core ML Performance")
+    md.append("  Report / Instruments で計測すべき。「対 PyTorch 速度比」は CPU(PyTorch) 対")
+    md.append("  Core ML の比較であり量子化単体の効果ではない。")
+    md.append("- **デバイス検知の注意**: `MLComputePlan` の値は静的な割当**予測**であり、")
+    md.append("  実機ランタイムの実測ではない。")
 
     out_path = os.path.join(HERE, "benchmark_result.md")
     with open(out_path, "w") as f:

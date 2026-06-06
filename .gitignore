@@ -1,3 +1,6 @@
+# --- Datasets (downloaded by real_accuracy.py) ---
+data/
+
 # --- Build artifacts (regenerable via `python compressor.py`) ---
 artifacts/
 *.mlpackage/

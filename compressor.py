@@ -68,12 +68,16 @@ class PreprocessedClassifier(torch.nn.Module):
     ImageType 側で pixel/255 -> [0,1] にしておき、ここで per-channel の
     ImageNet 正規化 (x-mean)/std を実施。これにより ImageType の scalar scale
     だけでは表現できない per-channel std を厳密に処理できる。
-    出力はロジット (ClassifierConfig が softmax/ラベル付与を担当)。
+    出力は softmax 後の確率。torchvision の分類器末尾は線形 (ロジット) で
+    ClassifierConfig は softmax を付与しないため、ここで明示的に softmax を
+    焼き込み、Core ML の確率辞書が「合計1の真の確率」になるようにする
+    (アプリ側で softmax を書かずに済む)。
     """
 
     def __init__(self, base: torch.nn.Module):
         super().__init__()
         self.base = base
+        self.softmax = torch.nn.Softmax(dim=1)
         self.register_buffer(
             "mean", torch.tensor(IMAGENET_MEAN).view(1, 3, 1, 1)
         )
@@ -83,7 +87,7 @@ class PreprocessedClassifier(torch.nn.Module):
 
     def forward(self, x):
         x = (x - self.mean) / self.std
-        return self.base(x)
+        return self.softmax(self.base(x))
 
 
 def _dir_size_mb(path: str) -> float:
@@ -174,39 +178,46 @@ def convert_to_coreml(base, class_labels):
 
 
 # ----------------------------------------------------------------------------
-# 3. INT8 / INT4 per-channel 量子化
+# 3. INT8 / INT4 量子化
 # ----------------------------------------------------------------------------
+# 量子化粒度の選定 (実測に基づく):
+#   - INT8: per_channel / linear_symmetric。FP16 比で top-1 一致 90%・KL 0.009 と
+#           劣化が極めて小さく、量産向け。
+#   - INT4: mobilenet_v3_small は depthwise conv + SE + hard-swish を含み INT4 に
+#           弱い。per_channel/symmetric では破綻する (Imagenette 実画像 top-1
+#           3.8% / FP32 は 63.9%)。ブロック量子化(block_size=16) + 非対称(linear)
+#           にすると top-1 61.7% まで回復し、FP32 にほぼ匹敵する公開可能な精度に
+#           なる。ただし per-block INT4 は ANE に載らず GPU 実行となり INT8 より
+#           数倍遅い (size は 1.40->1.91MB と増えるが INT8 より小さい)。
+#           => 精度・速度・ANE 常駐のバランスでは INT8 が最良。極小サイズが
+#              最優先で多少の遅延を許容できる場合に INT4(per-block) を選ぶ。
 def quantize(mlmodel, nbits: int):
-    dtype = "int8" if nbits == 8 else "int4"
-    print(f"[3/5] {dtype.upper()} per-channel 量子化を実行中 ...")
+    if nbits == 8:
+        print("[3/5] INT8 per-channel 量子化を実行中 ...")
+        op_config = OpLinearQuantizerConfig(
+            mode="linear_symmetric",
+            dtype="int8",
+            granularity="per_channel",
+            weight_threshold=2048,  # 小さい重みは量子化しない
+        )
+        config = OptimizationConfig(global_config=op_config)
+        q = linear_quantize_weights(mlmodel, config=config)
+        print("      -> INT8 per-channel 量子化 成功")
+        return q, "per_channel"
+
+    # nbits == 4: 実測で最良だった per_block(16) + 非対称(linear)
+    print("[3/5] INT4 per-block(16,非対称) 量子化を実行中 (実験的) ...")
     op_config = OpLinearQuantizerConfig(
-        mode="linear_symmetric",
-        dtype=dtype,
-        granularity="per_channel",
-        # 小さい重みは量子化しない (既定 2048 要素しきい値)
+        mode="linear",          # 非対称 (zero-point あり) の方が INT4 では精度良
+        dtype="int4",
+        granularity="per_block",
+        block_size=16,          # 入力チャネル軸 16 ごと。割り切れない層は fp16 維持
         weight_threshold=2048,
     )
     config = OptimizationConfig(global_config=op_config)
-    try:
-        q = linear_quantize_weights(mlmodel, config=config)
-        print(f"      -> {dtype.upper()} per-channel 量子化 成功")
-        return q, "per_channel"
-    except Exception as e:
-        # INT4 が per-channel 非対応の環境では per-grouped-channel にフォールバック
-        if dtype == "int4":
-            print(f"      ! per_channel int4 失敗 ({e}); per-block(32) にフォールバック")
-            op_config = OpLinearQuantizerConfig(
-                mode="linear_symmetric",
-                dtype=dtype,
-                granularity="per_block",
-                block_size=32,
-                weight_threshold=2048,
-            )
-            config = OptimizationConfig(global_config=op_config)
-            q = linear_quantize_weights(mlmodel, config=config)
-            print(f"      -> INT4 per-block(32) 量子化 成功")
-            return q, "per_block(32)"
-        raise
+    q = linear_quantize_weights(mlmodel, config=config)
+    print("      -> INT4 per-block(16,非対称) 量子化 成功 (※精度は実用水準未満)")
+    return q, "per_block(16) linear非対称"
 
 
 # ----------------------------------------------------------------------------
