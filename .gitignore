@@ -28,6 +28,7 @@ env/
 
 # --- Local tooling / agent settings ---
 .claude/
+POST_DRAFTS.md
 
 # --- OS / editor ---
 .DS_Store
