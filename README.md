@@ -17,15 +17,17 @@ size, latency (mean / P95), the compute device each op actually runs on (via
 
 ## TL;DR — is it shippable?
 
-**Yes.** Both INT8 and INT4 keep accuracy within ~1pt of FP32 on real images.
+**Yes — ship INT8.** Validated on all 1000 classes (ImageNet-V2, 10k images).
 
-- **Ship INT8 by default** — accuracy ≈ FP32, stays resident on the ANE, fastest,
-  ¼ the size. Best overall balance.
-- **INT4 is also accurate enough** and even smaller, **but** it cannot stay on the
-  ANE (falls back to GPU) and is several times slower. Pick it only when minimal
-  size matters more than latency.
+- **Ship INT8 by default** — top-1 is **-0.0pt vs FP32**, stays resident on the
+  ANE, fastest, ¼ the size. Best overall balance, no measurable accuracy loss.
+- **INT4 is smaller but has a real, modest loss** — **-2.8pt top-1** across all
+  1000 classes, **and** it can't stay on the ANE (falls back to GPU) so it's
+  several times slower. Pick it only when minimal size beats latency & 2-3pt.
 - **Quantization recipe matters a lot for INT4.** Naive per-channel/symmetric INT4
   *collapses* (3.8% top-1). You must use **per-block(16) + asymmetric**.
+- **Watch out for evaluation bias:** a 10-class subset (Imagenette) made INT4 look
+  near-lossless (-0.4pt). Only full-1000-class evaluation revealed the true -2.8pt.
 
 ---
 
@@ -44,21 +46,25 @@ after 10 warmup runs, `ComputeUnit=ALL`.
 | **Core ML INT8** | **per-channel / symmetric** | **2.60** | **73.6%** | **0.264×** |
 | Core ML INT4 | per-block(16) / asymmetric | 1.91 | 80.6% | 0.194× |
 
-### 2. Accuracy on real images (Imagenette, the metric that decides shippability)
+### 2. Accuracy on real images — all 1000 classes (the metric that decides shippability)
 
-Absolute top-1 / top-5 on **Imagenette** (a 10-class real-image subset of
-ImageNet, validation split). PyTorch FP32 is the ground-truth baseline.
+Absolute top-1 / top-5 on **ImageNet-V2** (matched-frequency, all 1000 classes ×
+10 = 10,000 images). The original ImageNet val set is access-gated, so this public,
+full-1000-class test set is used; V2 is harder than the original val (absolute
+numbers run lower) but covers every class. Preprocessing matches torchvision's
+official transform (resize-256 → center-crop-224). PyTorch FP32 is the baseline.
 
 | Model | top-1 | top-5 | Δ top-1 vs FP32 | Verdict |
 |---|---:|---:|---:|---|
-| PyTorch FP32 | 63.9% | 86.9% | — | baseline |
-| Core ML FP16 | 62.8% | 86.1% | -1.1pt | ✅ shippable |
-| **Core ML INT8** | **62.9%** | **86.3%** | **-1.1pt** | ✅ **shippable** |
-| Core ML INT4 | 63.5% | 84.6% | -0.4pt | ✅ shippable |
+| PyTorch FP32 | 54.71% | 77.19% | — | baseline |
+| Core ML FP16 | 54.84% | 76.96% | +0.1pt | ✅ shippable |
+| **Core ML INT8** | **54.68%** | **76.83%** | **-0.0pt** | ✅ **shippable** |
+| Core ML INT4 | 51.91% | 75.23% | -2.8pt | ⚠️ usable, real loss |
 
-> Imagenette has only 10 classes, so absolute numbers run higher than full
-> 1000-class ImageNet. It's sufficient to judge *relative* quantization loss;
-> confirm final numbers on full-ImageNet val before a production release.
+> A 10-class subset (Imagenette) reported INT4 at only **-0.4pt** — full-1000-class
+> evaluation is what exposed the true **-2.8pt**. Don't judge quantization on a
+> handful of easy classes. (Run `imagenetv2_accuracy.py` / `real_accuracy.py` to
+> reproduce both.)
 
 ### 3. Latency & compute device
 
@@ -106,9 +112,15 @@ python compressor.py
 # 2. Benchmark size / latency / hardware / synthetic drift. Writes benchmark_result.md
 python benchmark.py
 
-# 3. (optional) Absolute accuracy on real images. Downloads Imagenette (~95 MB) to data/,
-#    writes artifacts/real_accuracy.json (then re-run benchmark.py to fold it into the report)
+# 3. (recommended) Full 1000-class accuracy. Downloads ImageNet-V2 (~1.2 GB) to data/,
+#    writes artifacts/imagenetv2_accuracy.json
+python imagenetv2_accuracy.py
+
+# 3b. (optional) Quick 10-class accuracy. Downloads Imagenette (~95 MB) to data/,
+#     writes artifacts/real_accuracy.json
 python real_accuracy.py
+
+# Re-run benchmark.py after step 3/3b to fold the accuracy tables into the report.
 ```
 
 The generated `.mlpackage` files can be dropped straight into Xcode.
@@ -129,8 +141,8 @@ The generated `.mlpackage` files can be dropped straight into Xcode.
    - **INT4** — `granularity="per_block"`, `block_size=16`, `mode="linear"`
      (asymmetric). `mobilenet_v3_small` (depthwise convs + SE blocks + hard-swish)
      is hostile to INT4: per-channel/symmetric collapses to 3.8% top-1, while
-     per-block/asymmetric recovers to ≈ FP32. Layers whose channel count isn't
-     divisible by the block size stay FP16.
+     per-block/asymmetric recovers to within -2.8pt of FP32 (all 1000 classes).
+     Layers whose channel count isn't divisible by the block size stay FP16.
 3. **INT4** requires `minimum_deployment_target=iOS18` (macOS 15) and the native
    blob-storage writer in `coremltools 9.0`.
 
@@ -138,8 +150,9 @@ The generated `.mlpackage` files can be dropped straight into Xcode.
 
 ```
 compressor.py          # convert + quantize (fp16 / int8 / int4), softmax baked in
-benchmark.py           # size / latency / compute-device / synthetic drift / real-acc table
-real_accuracy.py       # absolute top-1/top-5 on real images (Imagenette)
+benchmark.py           # size / latency / compute-device / synthetic drift / real-acc tables
+imagenetv2_accuracy.py # absolute top-1/top-5 on all 1000 classes (ImageNet-V2)
+real_accuracy.py       # quick absolute top-1/top-5 on 10 classes (Imagenette)
 requirements.txt       # pinned, verified dependency set
 benchmark_result.md    # generated report (sample committed)
 artifacts/             # generated models + manifest (git-ignored, regenerable)
@@ -161,15 +174,18 @@ PyTorch の画像分類モデル（`mobilenet_v3_small`）を **Apple Neural Eng
 向けの量子化 **Core ML** モデルへ変換・圧縮し、**実画像精度まで含めて**厳密に
 計測する再現可能なパイプラインです。
 
-### 結論：公開できます
+### 結論：INT8 で公開できます
 
-実画像（Imagenette）での top-1 劣化は INT8 / INT4 ともに FP32 比 約1pt 以内。
+全1000クラス（ImageNet-V2, 1万枚）で検証した top-1 劣化（対 FP32）:
+**FP16 +0.1pt / INT8 -0.0pt / INT4 -2.8pt**。
 
-- **デフォルトは INT8 推奨**：精度ほぼ無劣化・ANE 常駐・最速・サイズ 1/4。
-- **INT4 も公開可能な精度**でさらに小さい（1.91MB）が、ANE に載れず GPU 実行で
-  INT8 より数倍遅い。極小サイズ最優先・遅延許容のとき選択。
+- **デフォルトは INT8 推奨**：精度の実測劣化なし・ANE 常駐・最速・サイズ 1/4。
+- **INT4 はさらに小さいが軽い精度低下あり**（全クラスで top-1 -2.8pt）。さらに
+  ANE に載れず GPU 実行で INT8 より数倍遅い。サイズ最優先・2〜3pt 許容時のみ。
 - **INT4 は量子化レシピが重要**：素朴な per-channel/対称は破綻（top-1 3.8%）。
   **per-block(16) + 非対称**が必須。
+- **評価データに注意**：10クラス（Imagenette）では INT4 -0.4pt と過小評価。
+  全1000クラス評価で初めて真の -2.8pt が判明。
 
 ### 主な実装ポイント
 
@@ -182,9 +198,9 @@ PyTorch の画像分類モデル（`mobilenet_v3_small`）を **Apple Neural Eng
 
 ```bash
 pip install -r requirements.txt
-python compressor.py     # 変換・量子化
-python benchmark.py      # サイズ / レイテンシ / 実行HW / 精度
-python real_accuracy.py  # 実画像での絶対精度（Imagenette を data/ に DL）
+python compressor.py          # 変換・量子化
+python imagenetv2_accuracy.py # 全1000クラス絶対精度（ImageNet-V2 を data/ に DL）
+python benchmark.py           # サイズ / レイテンシ / 実行HW / 精度
 ```
 
 > 注：`predict()` 計測のレイテンシは Python オーバーヘッドが支配的で、FP16/INT8 は

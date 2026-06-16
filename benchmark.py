@@ -277,39 +277,54 @@ def main():
         md.append(f"| {name} | {device} | {mean_ms:.3f} | {p95_ms:.3f} | {speedup:.2f}× |")
     md.append("")
 
-    # 表3: 実画像での絶対精度 (公開可否の判断に使う最重要指標)
-    real_path = os.path.join(ARTIFACT_DIR, "real_accuracy.json")
     section_no = 3
-    if os.path.exists(real_path):
-        real = json.load(open(real_path))
-        fp32_top1 = real.get("PyTorch FP32", {}).get("top1")
-        md.append("## 3. 実画像での絶対精度 (Imagenette, 公開判断の最重要指標)\n")
-        md.append("ImageNet の 10 クラス実画像サブセット **Imagenette** で計測した")
-        md.append("絶対 top-1 / top-5 精度。PyTorch FP32 を真のベースラインとする。\n")
+
+    def _acc_table(title, intro_lines, json_data, note_lines):
+        nonlocal section_no
+        fp32_top1 = json_data.get("PyTorch FP32", {}).get("top1")
+        md.append(f"## {section_no}. {title}\n")
+        md.extend(intro_lines + [""])
         md.append("| モデル | top-1 | top-5 | 対 FP32 top-1 差 | 判定 |")
         md.append("|---|---:|---:|---:|---|")
-        order = ["PyTorch FP32", "Core ML FP16", "Core ML INT8", "Core ML INT4"]
-        for label in order:
-            if label not in real:
+        for label in ["PyTorch FP32", "Core ML FP16", "Core ML INT8", "Core ML INT4"]:
+            if label not in json_data:
                 continue
-            t1 = real[label]["top1"]
-            t5 = real[label]["top5"]
+            t1, t5 = json_data[label]["top1"], json_data[label]["top5"]
             if label == "PyTorch FP32":
                 diff, vd = "— (基準)", "基準"
             else:
                 d = t1 - fp32_top1
                 diff = f"{d:+.1f}pt"
-                if d >= -1.5:
-                    vd = "✅ 公開可 (劣化ほぼ無し)"
-                elif d >= -3.0:
-                    vd = "✅ 公開可 (劣化小)"
-                else:
-                    vd = "⚠️ 要検討"
-            md.append(f"| {label} | {t1:.1f}% | {t5:.1f}% | {diff} | {vd} |")
+                vd = ("✅ 公開可 (劣化ほぼ無し)" if d >= -1.5
+                      else "✅ 公開可 (劣化小)" if d >= -3.0
+                      else "⚠️ 劣化あり (用途次第)")
+            md.append(f"| {label} | {t1:.2f}% | {t5:.2f}% | {diff} | {vd} |")
         md.append("")
-        md.append("> Imagenette は 10 クラスのため絶対値は full-ImageNet(1000クラス) より高め。")
-        md.append("> 量子化による相対劣化の評価には十分。full-ImageNet での確定が望ましい。\n")
-        section_no = 4
+        md.extend(note_lines + [""])
+        section_no += 1
+
+    # 表3: ImageNet-V2 全1000クラスでの絶対精度 (公開判断の最重要指標)
+    v2_path = os.path.join(ARTIFACT_DIR, "imagenetv2_accuracy.json")
+    if os.path.exists(v2_path):
+        _acc_table(
+            "実画像・全1000クラス絶対精度 (ImageNet-V2, 最重要指標)",
+            ["**ImageNet-V2 (matched-frequency, 全1000クラス×10枚=10,000枚)** での絶対",
+             "top-1 / top-5。前処理は torchvision 公式 (短辺256→中央224) に統一。",
+             "V2 は本来の val より難しく絶対値は低めだが、**全クラスを評価できる**。"],
+            json.load(open(v2_path)),
+            ["> 量子化の劣化が全クラスで確定: FP16/INT8 はほぼ無劣化、INT4 は top-1 約 -2.8pt。"],
+        )
+
+    # 表: Imagenette 10クラスでの絶対精度 (補助)
+    real_path = os.path.join(ARTIFACT_DIR, "real_accuracy.json")
+    if os.path.exists(real_path):
+        _acc_table(
+            "(補助) 実画像・10クラス絶対精度 (Imagenette)",
+            ["ImageNet の 10 クラス実画像サブセット **Imagenette** での絶対精度。",
+             "クラス数が少ないため絶対値は高め (易しいクラス構成)。"],
+            json.load(open(real_path)),
+            ["> 10 クラスのみのため INT4 の劣化が過小評価される。全クラス評価は上表 (ImageNet-V2)。"],
+        )
 
     # 表(参考): 合成入力での相対ドリフト
     md.append(f"## {section_no}. (参考) 合成入力での相対ドリフト (FP16 基準)\n")
@@ -345,16 +360,18 @@ def main():
     md.append("  per-channel の ImageNet 正規化 `(x-mean)/std` をモデル先頭層に焼き込み、")
     md.append("  さらに **softmax をモデル末尾に焼き込み**済み。出力は合計1の真の確率辞書で、")
     md.append("  Swift 側は `model.prediction(image:)` を呼ぶだけ (前処理・softmax 不要)。")
-    md.append("- **総合推奨は INT8**: 実画像 top-1 は FP32 とほぼ同等 (上表)、サイズ FP32 比")
-    md.append("  1/4、ANE 常駐で最速。精度・サイズ・速度・ANE 常駐のバランスが最良で公開向き。")
-    md.append("- **INT4 (per-block16/非対称) も公開可能な精度**: 実画像 top-1 は FP32 とほぼ同等。")
-    md.append("  ただし per-channel/対称では破綻する (実画像 top-1 3.8%) ため必ず per-block/非対称を")
+    md.append("- **総合推奨は INT8**: 全1000クラス (ImageNet-V2) で top-1 は FP32 と実質同等")
+    md.append("  (-0.0pt)、サイズ FP32 比 1/4、ANE 常駐で最速。精度・サイズ・速度・ANE 常駐の")
+    md.append("  バランスが最良で、まず INT8 を選べば間違いない。")
+    md.append("- **INT4 (per-block16/非対称) は軽量だが軽い精度劣化あり**: 全1000クラスで top-1")
+    md.append("  約 -2.8pt の劣化 (10クラス Imagenette では -0.4pt と過小評価される点に注意)。")
+    md.append("  per-channel/対称では完全に破綻する (実画像 top-1 3.8%) ため必ず per-block/非対称を")
     md.append("  使うこと。さらに INT4 は ANE に載らず GPU 実行で INT8 より数倍遅い。")
-    md.append("  => 極小サイズが最優先で多少の遅延を許容できる場合のみ INT4 を選ぶ。")
+    md.append("  => INT4 はサイズ最優先 (-0.7MB) で 2〜3pt の精度低下と低速化を許容できる場合のみ。")
     md.append("- **レイテンシの注意**: FP16 と INT8 がほぼ同値なのは ANE 実行かつ Python")
     md.append("  `predict()` のオーバーヘッドが支配的なため。一方 INT4(per-block) は ANE に")
-    md.append("  載らず GPU にフォールバックするため**逆に数倍遅い** (精度は同等だが速度と")
-    md.append("  ANE 常駐で INT8 に劣る)。厳密な実機レイテンシは Xcode の Core ML Performance")
+    md.append("  載らず GPU にフォールバックするため**逆に数倍遅い** (速度・精度・ANE 常駐の")
+    md.append("  すべてで INT8 に劣る)。厳密な実機レイテンシは Xcode の Core ML Performance")
     md.append("  Report / Instruments で計測すべき。「対 PyTorch 速度比」は CPU(PyTorch) 対")
     md.append("  Core ML の比較であり量子化単体の効果ではない。")
     md.append("- **デバイス検知の注意**: `MLComputePlan` の値は静的な割当**予測**であり、")
